@@ -118,6 +118,55 @@ Done:
 }
 
 STATIC
+BOOLEAN
+LzmaSuffix (
+  CONST CHAR16  *Path
+  )
+{
+  UINTN  Chars;
+
+  Chars = StrLen (Path);
+  return (Chars >= 5) && (StrCmp (Path + Chars - 5, L".lzma") == 0);
+}
+
+STATIC
+EFI_STATUS
+DecompressKernel (
+  VOID   *Compressed,
+  UINTN  CompressedSize,
+  VOID   **Image,
+  UINTN  *ImageSize
+  )
+{
+  EFI_STATUS  Status;
+  UINT64      RawSize;
+
+  RawSize = 0;
+  Status  = DarwinBootLzmaGetInfo (Compressed, CompressedSize, &RawSize);
+  if (EFI_ERROR (Status) || (RawSize == 0) || (RawSize > KERNEL_IMAGE_LIMIT)) {
+    Print (L"DARWINBOOT: compressed kernel size %lu rejected (%r)\n", RawSize, Status);
+    return EFI_ERROR (Status) ? Status : EFI_BAD_BUFFER_SIZE;
+  }
+
+  *Image = AllocatePool ((UINTN)RawSize);
+  if (*Image == NULL) {
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  Status = DarwinBootLzmaDecompress (Compressed, CompressedSize, *Image, (UINTN)RawSize);
+  if (EFI_ERROR (Status)) {
+    FreePool (*Image);
+    *Image = NULL;
+    Print (L"DARWINBOOT: compressed kernel rejected (%r)\n", Status);
+    return Status;
+  }
+
+  *ImageSize = (UINTN)RawSize;
+  Print (L"DARWINBOOT: kernel %lu bytes compressed to %lu\n", RawSize, (UINT64)CompressedSize);
+  return EFI_SUCCESS;
+}
+
+STATIC
 EFI_STATUS
 ReadKernel (
   EFI_FILE_PROTOCOL *Root,
@@ -131,21 +180,36 @@ ReadKernel (
   CHAR16      *LzmaPath;
   VOID        *Compressed;
   UINTN       CompressedSize;
-  UINT64      RawSize;
 
   //
-  // The payload may carry the image as it is or as "<path>.lzma"; a kernel collection only fits the
-  // 96 MiB vendor_boot partition in the compressed form (vendor_boot_a, 0x6000000).
+  // The payload may carry the image as it is, as "<path>.lzma" next to it, or name the compressed
+  // file directly: a kernel collection only fits the 96 MiB vendor_boot partition compressed
+  // (vendor_boot_a, 0x6000000). A boot-test kernel is a plain MH_EXECUTE and needs none of this.
   //
   *Image     = NULL;
   *ImageSize = 0;
-  Status     = ReadFile (Root, Path, KERNEL_IMAGE_LIMIT, Image, ImageSize);
+  Compressed = NULL;
+  if (LzmaSuffix (Path)) {
+    Status = ReadFile (Root, Path, KERNEL_LZMA_LIMIT, &Compressed, &CompressedSize);
+    if (EFI_ERROR (Status)) {
+      return Status;
+    }
+
+    Status = DecompressKernel (Compressed, CompressedSize, Image, ImageSize);
+    FreePool (Compressed);
+    return Status;
+  }
+
+  Status = ReadFile (Root, Path, KERNEL_IMAGE_LIMIT, Image, ImageSize);
   if (!EFI_ERROR (Status) || (Status != EFI_NOT_FOUND)) {
     return Status;
   }
 
+  //
+  // Build "<path>.lzma". The destination must already hold a terminated string: StrCatS appends to it.
+  //
   Length = StrSize (Path);
-  if (Length / sizeof (CHAR16) > (MAX_UINTN / sizeof (CHAR16)) - 6) {
+  if ((Length / sizeof (CHAR16)) + 5 >= MAX_UINTN / sizeof (CHAR16)) {
     return EFI_OUT_OF_RESOURCES;
   }
 
@@ -154,42 +218,20 @@ ReadKernel (
     return EFI_OUT_OF_RESOURCES;
   }
 
-  CopyMem (LzmaPath, Path, Length - sizeof (CHAR16));
-  StrCatS (LzmaPath, Length / sizeof (CHAR16) + 6, L".lzma");
-  Compressed     = NULL;
+  CopyMem (LzmaPath, Path, Length);
+  StrCatS (LzmaPath, (Length / sizeof (CHAR16)) + 6, L".lzma");
   CompressedSize = 0;
-  RawSize        = 0;
   Status         = ReadFile (Root, LzmaPath, KERNEL_LZMA_LIMIT, &Compressed, &CompressedSize);
+  if (EFI_ERROR (Status)) {
+    Print (L"DARWINBOOT: %s and %s: %r\n", Path, LzmaPath, Status);
+    FreePool (LzmaPath);
+    return Status;
+  }
+
   FreePool (LzmaPath);
-  if (EFI_ERROR (Status)) {
-    return Status;
-  }
-
-  Status = DarwinBootLzmaGetInfo (Compressed, CompressedSize, &RawSize);
-  if (EFI_ERROR (Status) || (RawSize == 0) || (RawSize > KERNEL_IMAGE_LIMIT)) {
-    Print (L"DARWINBOOT: compressed kernel size %lu rejected\n", RawSize);
-    FreePool (Compressed);
-    return EFI_ERROR (Status) ? Status : EFI_BAD_BUFFER_SIZE;
-  }
-
-  *Image = AllocatePool ((UINTN)RawSize);
-  if (*Image == NULL) {
-    FreePool (Compressed);
-    return EFI_OUT_OF_RESOURCES;
-  }
-
-  Status = DarwinBootLzmaDecompress (Compressed, CompressedSize, *Image, (UINTN)RawSize);
+  Status = DecompressKernel (Compressed, CompressedSize, Image, ImageSize);
   FreePool (Compressed);
-  if (EFI_ERROR (Status)) {
-    FreePool (*Image);
-    *Image = NULL;
-    Print (L"DARWINBOOT: compressed kernel rejected (%r)\n", Status);
-    return Status;
-  }
-
-  *ImageSize = (UINTN)RawSize;
-  Print (L"DARWINBOOT: kernel %lu bytes compressed to %lu\n", RawSize, (UINT64)CompressedSize);
-  return EFI_SUCCESS;
+  return Status;
 }
 
 STATIC
