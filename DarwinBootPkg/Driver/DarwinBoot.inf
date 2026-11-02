@@ -14,6 +14,19 @@
   BootVideo.h
   DiagFont.h
   Entry.S
+  # LZMA decoder for "<kernel>.lzma": a prelinked macOS kernel collection is 132.8 MiB and
+  # vendor_boot_a is 96 MiB, so the payload carries it compressed. Vendored from MdeModulePkg's
+  # LzmaCustomDecompressLib (public-domain LZMA SDK) instead of linked as a library class: the
+  # library is NULL-class with a guided-section constructor this driver does not need.
+  Lzma/DarwinBootLzma.c
+  Lzma/DarwinBootLzma.h
+  Lzma/LzmaDec.c
+  Lzma/LzmaDec.h
+  Lzma/7zTypes.h
+  Lzma/Compiler.h
+  Lzma/CpuArch.h
+  Lzma/Precomp.h
+  Lzma/UefiLzma.h
 
 [Packages]
   MdePkg/MdePkg.dec

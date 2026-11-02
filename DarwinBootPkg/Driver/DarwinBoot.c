@@ -16,8 +16,16 @@
 #include "BootVideo.h"
 #include "PackedRamdisk.h"
 #include "WindowSize.h"
+#include "Lzma/DarwinBootLzma.h"
 
 #define WINDOW_SIZE  SIZE_256MB
+//
+// A prelinked macOS kernel is a kernel collection whose image is as large as the original
+// kernelcache (132.8 MiB for 25F84), so the plain-image cap is the window cap, not 128 MB.
+// The compressed form is the one that travels inside the payload volume.
+//
+#define KERNEL_IMAGE_LIMIT  SIZE_256MB
+#define KERNEL_LZMA_LIMIT   SIZE_64MB
 #define BLOCK_SIZE   SIZE_2MB
 #define MAX_SEGMENTS 64
 
@@ -107,6 +115,81 @@ Done:
   File->Close (File);
   if (EFI_ERROR (Status) && (*Data != NULL)) { FreePool (*Data); *Data = NULL; }
   return Status;
+}
+
+STATIC
+EFI_STATUS
+ReadKernel (
+  EFI_FILE_PROTOCOL *Root,
+  CONST CHAR16      *Path,
+  VOID              **Image,
+  UINTN             *ImageSize
+  )
+{
+  EFI_STATUS  Status;
+  UINTN       Length;
+  CHAR16      *LzmaPath;
+  VOID        *Compressed;
+  UINTN       CompressedSize;
+  UINT64      RawSize;
+
+  //
+  // The payload may carry the image as it is or as "<path>.lzma"; a kernel collection only fits the
+  // 96 MiB vendor_boot partition in the compressed form (vendor_boot_a, 0x6000000).
+  //
+  *Image     = NULL;
+  *ImageSize = 0;
+  Status     = ReadFile (Root, Path, KERNEL_IMAGE_LIMIT, Image, ImageSize);
+  if (!EFI_ERROR (Status) || (Status != EFI_NOT_FOUND)) {
+    return Status;
+  }
+
+  Length = StrSize (Path);
+  if (Length / sizeof (CHAR16) > (MAX_UINTN / sizeof (CHAR16)) - 6) {
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  LzmaPath = AllocatePool (Length + 6 * sizeof (CHAR16));
+  if (LzmaPath == NULL) {
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  CopyMem (LzmaPath, Path, Length - sizeof (CHAR16));
+  StrCatS (LzmaPath, Length / sizeof (CHAR16) + 6, L".lzma");
+  Compressed     = NULL;
+  CompressedSize = 0;
+  RawSize        = 0;
+  Status         = ReadFile (Root, LzmaPath, KERNEL_LZMA_LIMIT, &Compressed, &CompressedSize);
+  FreePool (LzmaPath);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = DarwinBootLzmaGetInfo (Compressed, CompressedSize, &RawSize);
+  if (EFI_ERROR (Status) || (RawSize == 0) || (RawSize > KERNEL_IMAGE_LIMIT)) {
+    Print (L"DARWINBOOT: compressed kernel size %lu rejected\n", RawSize);
+    FreePool (Compressed);
+    return EFI_ERROR (Status) ? Status : EFI_BAD_BUFFER_SIZE;
+  }
+
+  *Image = AllocatePool ((UINTN)RawSize);
+  if (*Image == NULL) {
+    FreePool (Compressed);
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  Status = DarwinBootLzmaDecompress (Compressed, CompressedSize, *Image, (UINTN)RawSize);
+  FreePool (Compressed);
+  if (EFI_ERROR (Status)) {
+    FreePool (*Image);
+    *Image = NULL;
+    Print (L"DARWINBOOT: compressed kernel rejected (%r)\n", Status);
+    return Status;
+  }
+
+  *ImageSize = (UINTN)RawSize;
+  Print (L"DARWINBOOT: kernel %lu bytes compressed to %lu\n", RawSize, (UINT64)CompressedSize);
+  return EFI_SUCCESS;
 }
 
 STATIC
@@ -637,7 +720,7 @@ Boot (
   if (EFI_ERROR (Status)) { return Status; }
   Status = Fs->OpenVolume (Fs, &Root);
   if (EFI_ERROR (Status)) { return Status; }
-  Status = ReadFile (Root, Request->KernelPath, SIZE_128MB, &Image, &ImageSize);
+  Status = ReadKernel (Root, Request->KernelPath, &Image, &ImageSize);
   if (EFI_ERROR (Status)) { goto Fail; }
   Status = ParseKernel (Image, ImageSize, &Kernel);
   if (EFI_ERROR (Status)) { goto Fail; }
